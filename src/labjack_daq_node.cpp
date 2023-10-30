@@ -94,6 +94,8 @@ int main(int argc, char** argv)
 // Counters for this example
 int ConfigIO_example(HANDLE hDevice, int* isDAC1Enabled)
 {
+    printf("ConfigIO_example...\n");
+
     uint8  sendBuff[12], recBuff[12];
     uint16 checksumTotal;
     int    sendChars, recChars;
@@ -192,6 +194,7 @@ int ConfigIO_example(HANDLE hDevice, int* isDAC1Enabled)
 
     *isDAC1Enabled = (int)recBuff[9];
 
+    printf("ConfigIO_example... OK\n");
     return 0;
 }
 
@@ -362,7 +365,7 @@ void LabjackNode::onReadAndPubTimer()
     int    totalPackets;  // The total number of StreamData responses read
 
     // Number of packets to read before displaying streaming information
-    constexpr int numReadsPerDisplay = 24;
+    constexpr int numReadsPerDisplay = 1;
 
     // Multiplier for the StreamData receive buffer size
     constexpr int readSizeMultiplier = 5;
@@ -599,8 +602,10 @@ int StreamStop(HANDLE hDevice)
 
     if (recBuff[2] != 0)
     {
+#if 0
         printf(
             "Errorcode # %d from StreamStop read.\n", (unsigned int)recBuff[2]);
+#endif
         return -1;
     }
 
