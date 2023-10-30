@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <vector>
 
 #include "u3.h"
@@ -15,8 +15,6 @@
 int ConfigIO_example(HANDLE hDevice, int* isDAC1Enabled);
 int StreamConfig_example(HANDLE hDevice);
 int StreamStart(HANDLE hDevice);
-int StreamData_example(
-    HANDLE hDevice, u3CalibrationInfo* caliInfo, int isDAC1Enabled);
 int StreamStop(HANDLE hDevice);
 
 // For this example to work proper SamplesPerPacket needs to be a multiple of
@@ -34,41 +32,53 @@ class LabjackNode : public rclcpp::Node
     {
         // Open the device:
         // Opening first found U3 over USB
-        if ((hDevice = openUSBConnection(-1)) == nullptr)
+        if ((hDevice_ = openUSBConnection(-1)) == nullptr)
             throw std::runtime_error("Error: openUSBConnection");
 
         // Getting calibration information from U3
-        if (getCalibrationInfo(hDevice, &caliInfo) < 0)
+        if (getCalibrationInfo(hDevice_, &caliInfo_) < 0)
             throw std::runtime_error("Error: getCalibrationInfo");
 
-        if (ConfigIO_example(hDevice, &dac1Enabled) != 0)
+        if (ConfigIO_example(hDevice_, &dac1Enabled_) != 0)
             throw std::runtime_error("Error: ConfigIO_example");
 
         // Stopping any previous streams
-        StreamStop(hDevice);
+        StreamStop(hDevice_);
 
-        if (StreamConfig_example(hDevice) != 0)
+        if (StreamConfig_example(hDevice_) != 0)
             throw std::runtime_error("Error: StreamConfig_example");
 
-        if (StreamStart(hDevice) != 0)
+        if (StreamStart(hDevice_) != 0)
             throw std::runtime_error("Error: StreamStart");
-
-        StreamData_example(hDevice, &caliInfo, dac1Enabled);
-        StreamStop(hDevice);
 
         // Parameters
         this->declare_parameter<double>("publish_rate", publish_rate_);
         this->get_parameter("publish_rate", publish_rate_);
+
+        timerPub_ = this->create_wall_timer(
+            std::chrono::duration<double>(1.0 / publish_rate_),
+            std::bind(&LabjackNode::onReadAndPubTimer, this));
+
+        adcPub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
+            "gpio_adc", 10);
     }
 
-    ~LabjackNode() { closeUSBConnection(hDevice); }
+    ~LabjackNode()
+    {
+        StreamStop(hDevice_);
+        closeUSBConnection(hDevice_);
+    }
 
    private:
-    double publish_rate_ = 10.0;
+    double                       publish_rate_ = 50.0;
+    rclcpp::TimerBase::SharedPtr timerPub_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr adcPub_;
 
-    HANDLE            hDevice = nullptr;
-    u3CalibrationInfo caliInfo;
-    int               dac1Enabled;
+    HANDLE            hDevice_ = nullptr;
+    u3CalibrationInfo caliInfo_;
+    int               dac1Enabled_;
+
+    void onReadAndPubTimer();
 };
 
 int main(int argc, char** argv)
@@ -342,22 +352,17 @@ int StreamStart(HANDLE hDevice)
 
 // Reads the StreamData low-level function response in a loop.  All voltages
 // from the stream are stored in the voltages 2D array.
-int StreamData_example(
-    HANDLE hDevice, u3CalibrationInfo* caliInfo, int isDAC1Enabled)
+void LabjackNode::onReadAndPubTimer()
 {
     uint16 voltageBytes, checksumTotal;
-    long   startTime, endTime;
     double hardwareVersion;
-    int    recBuffSize, recChars, backLog, autoRecoveryOn;
-    int    packetCounter, currChannel, scanNumber;
-    int    i, j, k, m;
+    int    recBuffSize, recChars, autoRecoveryOn;
+    int    currChannel, scanNumber;
+    int    j, k, m;
     int    totalPackets;  // The total number of StreamData responses read
 
     // Number of packets to read before displaying streaming information
     constexpr int numReadsPerDisplay = 24;
-
-    // Number of times to display streaming information
-    constexpr int numDisplay = 6;
 
     // Multiplier for the StreamData receive buffer size
     constexpr int readSizeMultiplier = 5;
@@ -372,184 +377,181 @@ int StreamData_example(
      */
     double voltages
         [(SamplesPerPacket / NumChannels) * readSizeMultiplier *
-         numReadsPerDisplay * numDisplay][NumChannels];
+         numReadsPerDisplay][NumChannels];
     uint8 recBuff[responseSize * readSizeMultiplier];
 
-    packetCounter   = 0;
     currChannel     = 0;
     scanNumber      = 0;
     totalPackets    = 0;
     recChars        = 0;
     autoRecoveryOn  = 0;
     recBuffSize     = 14 + SamplesPerPacket * 2;
-    hardwareVersion = caliInfo->hardwareVersion;
+    hardwareVersion = caliInfo_.hardwareVersion;
 
-    printf("Reading Samples...\n");
-
-    startTime = getTickCount();
-
-    for (i = 0; i < numDisplay; i++)
+    for (j = 0; j < numReadsPerDisplay; j++)
     {
-        for (j = 0; j < numReadsPerDisplay; j++)
+        /* For USB StreamData, use Endpoint 3 for reads.  You can read the
+         * multiple StreamData responses of 64 bytes only if
+         * SamplesPerPacket is 25 to help improve streaming performance.  In
+         * this example this multiple is adjusted by the readSizeMultiplier
+         * variable.
+         */
+
+        // Reading stream response from U3
+        recChars =
+            LJUSB_Stream(hDevice_, recBuff, responseSize * readSizeMultiplier);
+        if (recChars < responseSize * readSizeMultiplier)
         {
-            /* For USB StreamData, use Endpoint 3 for reads.  You can read the
-             * multiple StreamData responses of 64 bytes only if
-             * SamplesPerPacket is 25 to help improve streaming performance.  In
-             * this example this multiple is adjusted by the readSizeMultiplier
-             * variable.
-             */
-
-            // Reading stream response from U3
-            recChars = LJUSB_Stream(
-                hDevice, recBuff, responseSize * readSizeMultiplier);
-            if (recChars < responseSize * readSizeMultiplier)
-            {
-                if (recChars == 0)
-                    printf("Error : read failed (StreamData).\n");
-                else
-                    printf(
-                        "Error : did not read all of the buffer, expected %d "
-                        "bytes but received %d(StreamData).\n",
-                        responseSize * readSizeMultiplier, recChars);
-                return -1;
-            }
-
-            // Checking for errors and getting data out of each StreamData
-            // response
-            for (m = 0; m < readSizeMultiplier; m++)
-            {
-                totalPackets++;
-
-                checksumTotal =
-                    extendedChecksum16(recBuff + m * recBuffSize, recBuffSize);
-                if ((uint8)((checksumTotal / 256) & 0xFF) !=
-                    recBuff[m * recBuffSize + 5])
-                {
-                    printf(
-                        "Error : read buffer has bad checksum16(MSB) "
-                        "(StreamData).\n");
-                    return -1;
-                }
-
-                if ((uint8)(checksumTotal & 0xFF) !=
-                    recBuff[m * recBuffSize + 4])
-                {
-                    printf(
-                        "Error : read buffer has bad checksum16(LBS) "
-                        "(StreamData).\n");
-                    return -1;
-                }
-
-                checksumTotal = extendedChecksum8(recBuff + m * recBuffSize);
-                if (checksumTotal != recBuff[m * recBuffSize])
-                {
-                    printf(
-                        "Error : read buffer has bad checksum8 "
-                        "(StreamData).\n");
-                    return -1;
-                }
-
-                if (recBuff[m * recBuffSize + 1] != (uint8)(0xF9) ||
-                    recBuff[m * recBuffSize + 2] != 4 + SamplesPerPacket ||
-                    recBuff[m * recBuffSize + 3] != (uint8)(0xC0))
-                {
-                    printf(
-                        "Error : read buffer has wrong command bytes "
-                        "(StreamData).\n");
-                    return -1;
-                }
-
-                if (recBuff[m * recBuffSize + 11] == 59)
-                {
-                    if (!autoRecoveryOn)
-                    {
-                        printf(
-                            "\nU3 data buffer overflow detected in packet "
-                            "%d.\nNow using auto-recovery and reading buffered "
-                            "samples.\n",
-                            totalPackets);
-                        autoRecoveryOn = 1;
-                    }
-                }
-                else if (recBuff[m * recBuffSize + 11] == 60)
-                {
-                    printf(
-                        "Auto-recovery report in packet %d: %d scans were "
-                        "dropped.\nAuto-recovery is now off.\n",
-                        totalPackets,
-                        recBuff[m * recBuffSize + 6] +
-                            recBuff[m * recBuffSize + 7] * 256);
-                    autoRecoveryOn = 0;
-                }
-                else if (recBuff[m * recBuffSize + 11] != 0)
-                {
-                    printf(
-                        "Errorcode # %d from StreamData read.\n",
-                        (unsigned int)recBuff[11]);
-                    return -1;
-                }
-
-                if (packetCounter != (int)recBuff[m * recBuffSize + 10])
-                {
-                    printf(
-                        "PacketCounter (%d) does not match with with current "
-                        "packet count (%d)(StreamData).\n",
-                        recBuff[m * recBuffSize + 10], packetCounter);
-                    return -1;
-                }
-
-                backLog = (int)recBuff[m * 48 + 12 + SamplesPerPacket * 2];
-
-                for (k = 12; k < (12 + SamplesPerPacket * 2); k += 2)
-                {
-                    voltageBytes =
-                        (uint16)recBuff[m * recBuffSize + k] +
-                        (uint16)recBuff[m * recBuffSize + k + 1] * 256;
-
-                    if (hardwareVersion >= 1.30)
-                        getAinVoltCalibrated_hw130(
-                            caliInfo, currChannel, 31, voltageBytes,
-                            &(voltages[scanNumber][currChannel]));
-                    else
-                        getAinVoltCalibrated(
-                            caliInfo, isDAC1Enabled, 31, voltageBytes,
-                            &(voltages[scanNumber][currChannel]));
-
-                    currChannel++;
-                    if (currChannel >= NumChannels)
-                    {
-                        currChannel = 0;
-                        scanNumber++;
-                    }
-                }
-
-                if (packetCounter >= 255)
-                    packetCounter = 0;
-                else
-                    packetCounter++;
-            }
+            if (recChars == 0)
+                RCLCPP_ERROR(
+                    get_logger(), "Error : read failed (StreamData).\n");
+            else
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Error : did not read all of the buffer, expected %d "
+                    "bytes but received %d(StreamData).\n",
+                    responseSize * readSizeMultiplier, recChars);
+            return;
         }
 
-        printf("\nNumber of scans: %d\n", scanNumber);
-        printf("Total packets read: %d\n", totalPackets);
-        printf(
-            "Current PacketCounter: %d\n",
-            ((packetCounter == 0) ? 255 : packetCounter - 1));
-        printf("Current BackLog: %d\n", backLog);
+        // Checking for errors and getting data out of each StreamData
+        // response
+        for (m = 0; m < readSizeMultiplier; m++)
+        {
+            totalPackets++;
 
-        for (k = 0; k < NumChannels; k++)
-            printf("  AI%d: %.4f V\n", k, voltages[scanNumber - 1][k]);
+            checksumTotal =
+                extendedChecksum16(recBuff + m * recBuffSize, recBuffSize);
+            if ((uint8)((checksumTotal / 256) & 0xFF) !=
+                recBuff[m * recBuffSize + 5])
+            {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Error : read buffer has bad checksum16(MSB) "
+                    "(StreamData).\n");
+                return;
+            }
+
+            if ((uint8)(checksumTotal & 0xFF) != recBuff[m * recBuffSize + 4])
+            {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Error : read buffer has bad checksum16(LBS) "
+                    "(StreamData).\n");
+                return;
+            }
+
+            checksumTotal = extendedChecksum8(recBuff + m * recBuffSize);
+            if (checksumTotal != recBuff[m * recBuffSize])
+            {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Error : read buffer has bad checksum8 "
+                    "(StreamData).\n");
+                return;
+            }
+
+            if (recBuff[m * recBuffSize + 1] != (uint8)(0xF9) ||
+                recBuff[m * recBuffSize + 2] != 4 + SamplesPerPacket ||
+                recBuff[m * recBuffSize + 3] != (uint8)(0xC0))
+            {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Error : read buffer has wrong command bytes "
+                    "(StreamData).\n");
+                return;
+            }
+
+            if (recBuff[m * recBuffSize + 11] == 59)
+            {
+                if (!autoRecoveryOn)
+                {
+                    printf(
+                        "\nU3 data buffer overflow detected in packet "
+                        "%d.\nNow using auto-recovery and reading buffered "
+                        "samples.\n",
+                        totalPackets);
+                    autoRecoveryOn = 1;
+                }
+            }
+            else if (recBuff[m * recBuffSize + 11] == 60)
+            {
+                printf(
+                    "Auto-recovery report in packet %d: %d scans were "
+                    "dropped.\nAuto-recovery is now off.\n",
+                    totalPackets,
+                    recBuff[m * recBuffSize + 6] +
+                        recBuff[m * recBuffSize + 7] * 256);
+                autoRecoveryOn = 0;
+            }
+            else if (recBuff[m * recBuffSize + 11] != 0)
+            {
+                RCLCPP_ERROR(
+                    get_logger(), "Errorcode # %d from StreamData read.\n",
+                    (unsigned int)recBuff[11]);
+                return;
+            }
+
+#if 0  // JLBC: Allow streaming re-start, etc.
+            if (packetCounter != (int)recBuff[m * recBuffSize + 10])
+            {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "PacketCounter (%d) does not match with with current "
+                    "packet count (%d)(StreamData).\n",
+                    recBuff[m * recBuffSize + 10], packetCounter);
+                return;
+            }
+
+            backLog = (int)recBuff[m * 48 + 12 + SamplesPerPacket * 2];
+#endif
+
+            for (k = 12; k < (12 + SamplesPerPacket * 2); k += 2)
+            {
+                voltageBytes = (uint16)recBuff[m * recBuffSize + k] +
+                               (uint16)recBuff[m * recBuffSize + k + 1] * 256;
+
+                if (hardwareVersion >= 1.30)
+                    getAinVoltCalibrated_hw130(
+                        &caliInfo_, currChannel, 31, voltageBytes,
+                        &(voltages[scanNumber][currChannel]));
+                else
+                    getAinVoltCalibrated(
+                        &caliInfo_, dac1Enabled_, 31, voltageBytes,
+                        &(voltages[scanNumber][currChannel]));
+
+                currChannel++;
+                if (currChannel >= NumChannels)
+                {
+                    currChannel = 0;
+                    scanNumber++;
+                }
+            }
+
+#if 0
+            if (packetCounter >= 255)
+                packetCounter = 0;
+            else
+                packetCounter++;
+#endif
+        }
     }
 
-    endTime = getTickCount();
-    printf(
-        "\nRate of samples: %.0lf samples per second\n",
-        ((scanNumber * NumChannels) / ((endTime - startTime) / 1000.0)));
-    printf(
-        "Rate of scans: %.0lf scans per second\n\n",
-        (scanNumber / ((endTime - startTime) / 1000.0)));
+    RCLCPP_DEBUG(get_logger(), "Number of scans: %d\n", scanNumber);
+    RCLCPP_DEBUG(get_logger(), "Total packets read: %d\n", totalPackets);
 
-    return 0;
+#if 0
+    for (k = 0; k < NumChannels; k++)
+        printf("  AI%d: %.4f V\n", k, voltages[scanNumber - 1][k]);
+#endif
+
+    std_msgs::msg::Float32MultiArray msgAdc;
+    msgAdc.data.resize(NumChannels);
+
+    for (k = 0; k < NumChannels; k++)
+        msgAdc.data[k] = voltages[scanNumber - 1][k];
+
+    adcPub_->publish(msgAdc);
 }
 
 // Sends a StreamStop low-level command to stop streaming.
